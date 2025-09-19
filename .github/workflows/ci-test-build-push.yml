@@ -1,0 +1,94 @@
+name: ci-test-build-push
+on:
+  push:
+    branches: [ testing ]
+
+jobs:
+  test:
+    name: Run unit tests (all services)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+    strategy:
+      matrix:
+        svc: [ product_service, order_service, customer_service ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps & run tests (${{ matrix.svc }})
+        working-directory: backend/${{ matrix.svc }}
+        env:
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: "5432"
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+          pytest -q
+
+  build_push:
+    name: Build & push images (only if tests pass)
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      ACR: ${{ secrets.ACR_LOGIN_SERVER }}
+      SHA: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build & push product
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend/product_service
+          push: true
+          tags: |
+            ${{ env.ACR }}/product:${{ env.SHA }}
+            ${{ env.ACR }}/product:testing-latest
+
+      - name: Build & push order
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend/order_service
+          push: true
+          tags: |
+            ${{ env.ACR }}/order:${{ env.SHA }}
+            ${{ env.ACR }}/order:testing-latest
+
+      - name: Build & push customer
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend/customer_service
+          push: true
+          tags: |
+            ${{ env.ACR }}/customer:${{ env.SHA }}
+            ${{ env.ACR }}/customer:testing-latest

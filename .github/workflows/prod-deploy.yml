@@ -1,0 +1,161 @@
+name: prod-deploy
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    env:
+      ACR: ${{ secrets.ACR_LOGIN_SERVER }}
+      KUBECONFIG: ${{ runner.temp }}/kubeconfig
+      NS: prod
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      # Build & push a uniquely versioned image + a moving tag for prod
+      - name: Build & push product image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend/product_service
+          push: true
+          tags: |
+            ${{ env.ACR }}/product:${{ github.sha }}
+            ${{ env.ACR }}/product:prod-latest
+
+      # Use kubeconfig secret (no service principal needed)
+      - name: Reconstruct kubeconfig from secret
+        shell: bash
+        run: |
+          echo "${KUBECONFIG_B64}" | base64 -d > "$KUBECONFIG"
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+
+      - name: kubectl sanity check
+        run: |
+          kubectl version --client
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Ensure prod namespace exists
+        run: kubectl create ns "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: (Fallback) Create imagePull secret (if AKS not attached to ACR)
+        run: |
+          kubectl -n "$NS" create secret docker-registry acr-creds \
+            --docker-server="${{ secrets.ACR_LOGIN_SERVER }}" \
+            --docker-username="${{ secrets.ACR_USERNAME }}" \
+            --docker-password="${{ secrets.ACR_PASSWORD }}" \
+          || true
+
+      # Optional: simple Postgres in prod (use your managed DB if you have one)
+      - name: (Optional) Deploy Postgres (prod)
+        run: |
+          cat <<'YAML' | kubectl apply -n "$NS" -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: pg }
+          spec:
+            selector: { matchLabels: { app: pg } }
+            template:
+              metadata: { labels: { app: pg } }
+              spec:
+                containers:
+                  - name: pg
+                    image: postgres:15
+                    env:
+                      - { name: POSTGRES_USER, value: postgres }
+                      - { name: POSTGRES_PASSWORD, value: postgres }
+                      - { name: POSTGRES_DB, value: postgres }
+                    ports: [ { containerPort: 5432 } ]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: pg }
+          spec:
+            selector: { app: pg }
+            ports: [ { port: 5432, targetPort: 5432 } ]
+          YAML
+          kubectl -n "$NS" rollout status deploy/pg --timeout=180s
+
+      - name: Deploy/Update product (uses unique SHA image)
+        run: |
+          cat <<YAML | kubectl apply -n "$NS" -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: product
+          spec:
+            selector:
+              matchLabels: { app: product }
+            template:
+              metadata:
+                labels: { app: product }
+              spec:
+                imagePullSecrets:
+                  - name: acr-creds
+                containers:
+                  - name: product
+                    image: ${ACR}/product:${{ github.sha }}
+                    ports: [ { containerPort: 8000 } ]
+                    env:
+                      # Use pg service above; replace with your managed DB if available
+                      - { name: POSTGRES_HOST, value: pg }
+                      - { name: POSTGRES_PORT, value: "5432" }
+                      - { name: POSTGRES_DB, value: postgres }
+                      - { name: POSTGRES_USER, value: postgres }
+                      - { name: POSTGRES_PASSWORD, value: postgres }
+          ---
+          # ClusterIP for internal calls/smoke testing
+          apiVersion: v1
+          kind: Service
+          metadata: { name: product }
+          spec:
+            selector: { app: product }
+            ports:
+              - port: 8000
+                targetPort: 8000
+                protocol: TCP
+          ---
+          # Public entrypoint
+          apiVersion: v1
+          kind: Service
+          metadata: { name: product-public }
+          spec:
+            type: LoadBalancer
+            selector: { app: product }
+            ports:
+              - port: 80
+                targetPort: 8000
+                protocol: TCP
+          YAML
+
+      - name: Wait for rollout
+        run: |
+          kubectl -n "$NS" rollout status deploy/product --timeout=180s
+
+      - name: Smoke test (in-cluster)
+        shell: bash
+        run: |
+          set -e
+          kubectl -n "$NS" run curl --image=curlimages/curl:8.10.1 -i --rm --restart=Never -- \
+            sh -lc '
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://product:8000/health || true)
+              if [ "$code" != "200" ]; then
+                code=$(curl -s -o /dev/null -w "%{http_code}" http://product:8000/healthz || true)
+              fi
+              test "$code" = "200" && echo "OK ($code)" || (echo "Failed ($code)"; exit 1)
+            '
+
+      - name: Show public endpoint (if available)
+        run: kubectl -n "$NS" get svc product-public -o wide

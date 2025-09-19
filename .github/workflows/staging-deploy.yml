@@ -1,0 +1,130 @@
+name: staging-deploy
+
+on:
+  workflow_run:
+    workflows: [ "ci-test-build-push" ]  # run after CI succeeds
+    types: [ completed ]
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      ACR: ${{ secrets.ACR_LOGIN_SERVER }}
+      NS:  staging-${{ github.run_id }}
+      KUBECONFIG: ${{ runner.temp }}/kubeconfig
+
+    steps:
+      - name: Reconstruct kubeconfig from secret
+        shell: bash
+        run: |
+          echo "${KUBECONFIG_B64}" | base64 -d > "$KUBECONFIG"
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+
+      - name: kubectl sanity check
+        run: |
+          kubectl version --client
+          kubectl get nodes
+
+      - name: Create ephemeral staging namespace
+        run: kubectl create ns "$NS"
+
+      - name: (Fallback) Create imagePull secret (in case AKS not attached to ACR)
+        run: |
+          kubectl -n "$NS" create secret docker-registry acr-creds \
+            --docker-server="${{ secrets.ACR_LOGIN_SERVER }}" \
+            --docker-username="${{ secrets.ACR_USERNAME }}" \
+            --docker-password="${{ secrets.ACR_PASSWORD }}"
+
+      - name: Deploy Postgres (staging)
+        run: |
+          cat <<'YAML' | kubectl apply -n "$NS" -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: pg }
+          spec:
+            selector: { matchLabels: { app: pg } }
+            template:
+              metadata: { labels: { app: pg } }
+              spec:
+                containers:
+                - name: pg
+                  image: postgres:15
+                  env:
+                  - { name: POSTGRES_USER, value: postgres }
+                  - { name: POSTGRES_PASSWORD, value: postgres }
+                  - { name: POSTGRES_DB, value: postgres }
+                  ports: [ { containerPort: 5432 } ]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: pg }
+          spec:
+            selector: { app: pg }
+            ports: [ { port: 5432, targetPort: 5432 } ]
+          YAML
+          kubectl -n "$NS" rollout status deploy/pg --timeout=180s
+
+      - name: Deploy product (image from ACR)
+        run: |
+          cat <<YAML | kubectl apply -n "$NS" -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: product
+          spec:
+            selector:
+              matchLabels: { app: product }
+            template:
+              metadata:
+                labels: { app: product }
+              spec:
+                imagePullSecrets:
+                  - name: acr-creds
+                containers:
+                  - name: product
+                    image: ${ACR}/product:testing-latest
+                    ports: [ { containerPort: 8000 } ]
+                    env:
+                      - { name: POSTGRES_HOST, value: pg }
+                      - { name: POSTGRES_PORT, value: "5432" }
+                      - { name: POSTGRES_DB, value: postgres }
+                      - { name: POSTGRES_USER, value: postgres }
+                      - { name: POSTGRES_PASSWORD, value: postgres }
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: product }
+          spec:
+            selector: { app: product }
+            ports:
+              - port: 8000
+                targetPort: 8000
+                protocol: TCP
+          YAML
+          kubectl -n "$NS" rollout status deploy/product --timeout=180s
+
+      - name: Smoke test (try /health then /healthz)
+        shell: bash
+        run: |
+          set -e
+          kubectl -n "$NS" run curl --image=curlimages/curl:8.10.1 -i --rm --restart=Never -- \
+            sh -lc '
+              set -e
+              echo "Trying /health..."
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://product:8000/health || true)
+              if [ "$code" != "200" ]; then
+                echo "Trying /healthz..."
+                code=$(curl -s -o /dev/null -w "%{http_code}" http://product:8000/healthz || true)
+              fi
+              test "$code" = "200" && echo "OK ($code)" || (echo "Failed ($code)"; exit 1)
+            '
+
+      - name: Teardown staging namespace (always)
+        if: always()
+        run: kubectl delete ns "$NS" --wait=true
+
+    concurrency:
+      group: staging-${{ github.ref_name }}
+      cancel-in-progress: true
