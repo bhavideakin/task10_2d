@@ -9,7 +9,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ACR: ${{ secrets.ACR_LOGIN_SERVER }}
-      KUBECONFIG: ${{ runner.temp }}/kubeconfig
       NS: prod
 
     steps:
@@ -23,7 +22,6 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      # Build & push a uniquely versioned image + a moving tag for prod
       - name: Build & push product image
         uses: docker/build-push-action@v6
         with:
@@ -33,13 +31,12 @@ jobs:
             ${{ env.ACR }}/product:${{ github.sha }}
             ${{ env.ACR }}/product:prod-latest
 
-      # Use kubeconfig secret (no service principal needed)
+      # ✅ Reconstruct kubeconfig and export KUBECONFIG (no runner.temp in env)
       - name: Reconstruct kubeconfig from secret
         shell: bash
         run: |
-          echo "${KUBECONFIG_B64}" | base64 -d > "$KUBECONFIG"
-        env:
-          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
 
       - name: kubectl sanity check
         run: |
@@ -55,10 +52,8 @@ jobs:
           kubectl -n "$NS" create secret docker-registry acr-creds \
             --docker-server="${{ secrets.ACR_LOGIN_SERVER }}" \
             --docker-username="${{ secrets.ACR_USERNAME }}" \
-            --docker-password="${{ secrets.ACR_PASSWORD }}" \
-          || true
+            --docker-password="${{ secrets.ACR_PASSWORD }}" || true
 
-      # Optional: simple Postgres in prod (use your managed DB if you have one)
       - name: (Optional) Deploy Postgres (prod)
         run: |
           cat <<'YAML' | kubectl apply -n "$NS" -f -
@@ -88,60 +83,44 @@ jobs:
           YAML
           kubectl -n "$NS" rollout status deploy/pg --timeout=180s
 
-      - name: Deploy/Update product (uses unique SHA image)
+      - name: Deploy/Update product
         run: |
           cat <<YAML | kubectl apply -n "$NS" -f -
           apiVersion: apps/v1
           kind: Deployment
-          metadata:
-            name: product
+          metadata: { name: product }
           spec:
-            selector:
-              matchLabels: { app: product }
+            selector: { matchLabels: { app: product } }
             template:
-              metadata:
-                labels: { app: product }
+              metadata: { labels: { app: product } }
               spec:
-                imagePullSecrets:
-                  - name: acr-creds
+                imagePullSecrets: [ { name: acr-creds } ]
                 containers:
                   - name: product
                     image: ${ACR}/product:${{ github.sha }}
                     ports: [ { containerPort: 8000 } ]
                     env:
-                      # Use pg service above; replace with your managed DB if available
                       - { name: POSTGRES_HOST, value: pg }
                       - { name: POSTGRES_PORT, value: "5432" }
                       - { name: POSTGRES_DB, value: postgres }
                       - { name: POSTGRES_USER, value: postgres }
                       - { name: POSTGRES_PASSWORD, value: postgres }
           ---
-          # ClusterIP for internal calls/smoke testing
           apiVersion: v1
           kind: Service
           metadata: { name: product }
           spec:
             selector: { app: product }
-            ports:
-              - port: 8000
-                targetPort: 8000
-                protocol: TCP
+            ports: [ { port: 8000, targetPort: 8000, protocol: TCP } ]
           ---
-          # Public entrypoint
           apiVersion: v1
           kind: Service
           metadata: { name: product-public }
           spec:
             type: LoadBalancer
             selector: { app: product }
-            ports:
-              - port: 80
-                targetPort: 8000
-                protocol: TCP
+            ports: [ { port: 80, targetPort: 8000, protocol: TCP } ]
           YAML
-
-      - name: Wait for rollout
-        run: |
           kubectl -n "$NS" rollout status deploy/product --timeout=180s
 
       - name: Smoke test (in-cluster)
@@ -157,5 +136,5 @@ jobs:
               test "$code" = "200" && echo "OK ($code)" || (echo "Failed ($code)"; exit 1)
             '
 
-      - name: Show public endpoint (if available)
+      - name: Show public endpoint
         run: kubectl -n "$NS" get svc product-public -o wide
